@@ -25,18 +25,29 @@ def binarize_image(gray_image, method="adaptive"):
 
     # 'otsu' : good for high contrast, synthetic data 
     if method == "otsu":
-        # global thresholding 
-        thresh_val, binary = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Check if background is bright (high mean value)
+        if np.mean(gray_image) > 127:
+            mode = cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        else:
+            mode = cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            
+        thresh_val, binary = cv2.threshold(gray_image, 0, 255, mode)
 
     # 'adaptive Gaussian thresholding' : good for uneven lightening, low contrast 
     elif method == "adaptive":
+        # Check if background is bright
+        if np.mean(gray_image) > 127:
+            thresh_type = cv2.THRESH_BINARY_INV
+        else:
+            thresh_type = cv2.THRESH_BINARY
+            
         binary = cv2.adaptiveThreshold(
-            gray_image,
-            255,
+            gray_image, 
+            255, 
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 
-            blockSize = 11,
-            C = 2
+            thresh_type, # <--- Uses Inverse if background is bright
+            blockSize=11, 
+            C=2
         )
 
     else:
@@ -59,3 +70,21 @@ def denoise(binary_image, kernal_size = 3):
     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernal)
 
     return cleaned
+
+def connect_segments(binary_image, kernel_size=5, iterations=2):
+    """
+    dilate to meger broken neurites 
+    """
+    # Safety Check: Ensure the background is actually black.
+    # If the binary image came in wrong (White background), invert it here.
+    if np.mean(binary_image) > 127:
+        print("Warning: White background detected in bridging step. Inverting...")
+        binary_image = cv2.bitwise_not(binary_image)
+
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    
+    # Dilation: Expands white regions.
+    # This bridges gaps between the dots found in the thresholding step.
+    bridged = cv2.dilate(binary_image, kernel, iterations=iterations)
+    
+    return bridged

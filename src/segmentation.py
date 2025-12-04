@@ -29,7 +29,7 @@ def cca(binary_image):
     )
     return num_labels, labels, stats, centroids
 
-def get_valid_obj(num_labels, labels, stats, min_area=50):
+def get_valid_obj(num_labels, labels, stats, min_area):
     # filter noise 
     # return list of binary mask for each object present 
 
