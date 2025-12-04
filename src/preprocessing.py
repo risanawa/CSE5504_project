@@ -54,6 +54,6 @@ def denoise(binary_image, kernal_size = 3):
     cleaned = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernal)
 
     # closing : fill black holes
-    cleaned = cv2.mophologyEx(cleaned, cv2.MORPH_CLOSE, kernal)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernal)
 
     return cleaned
