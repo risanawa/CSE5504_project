@@ -5,29 +5,11 @@ import cv2
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-
-def convert_to_gray(image):
-    if len(image.shape) == 3:
-        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return image
-
-def binarize_image(gray_image, method="adaptive", block_size=11, C=2):
-    if method == "otsu":
-        thresh_val, binary = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    elif method == "adaptive":
-        binary = cv2.adaptiveThreshold(
-            gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, block_size, C
-        )
-    else:
-        raise ValueError("Method must be 'otsu' or 'adaptive'")
-    return binary
-
-def denoise(binary_image, kernel_size=3):
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    cleaned = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
-    return cleaned
+# Import from src folder
+from src.preprocessing import convert_to_gray, binarize_image, denoise
+from src.untangling import run_untangling
+from src.segmentation import cca, get_valid_obj
+from src.evaluation import continuous_iou, smooth_mask
 
 # ===== BBOX PARSING =====
 
@@ -119,7 +101,7 @@ def main():
         format_func=lambda x: f"Box {x}"
     )
     
-    # ===== PROCESSING CONTROLS (under box selector) =====
+    # ===== PROCESSING CONTROLS =====
     st.write("---")
     st.subheader("Processing Controls")
     
@@ -136,34 +118,64 @@ def main():
             C = st.slider("C (constant):", -10, 10, 2)
     
     with col_control2:
-        st.write("**Noise Reduction**")
+        st.write("**Morphological Operations**")
         use_denoise = st.checkbox("Apply denoising", value=True)
         kernel_size = 3
         if use_denoise:
             kernel_size = st.slider("Kernel Size:", 1, 15, 3, step=2)
+        
+        use_untangle = st.checkbox("Untangle touching neurons", value=False)
     
     st.write("---")
     
     # ===== GET SELECTED BOX =====
     box = [b for b in boxes if b['id'] == selected_id][0]
     
-    # Convert to pixels (exact bounding box, no padding)
+    # Convert to pixels
     x_min_px = int(box['x_min'] * width)
     y_min_px = int(box['y_min'] * height)
     x_max_px = int(box['x_max'] * width)
     y_max_px = int(box['y_max'] * height)
     
-    # Crop exactly to bounding box
+    # Crop to bounding box
     cropped = img_array[y_min_px:y_max_px, x_min_px:x_max_px]
     
     # ===== PROCESS IMAGE =====
+    # Convert to grayscale
     gray = convert_to_gray(cropped)
-    binary = binarize_image(gray, method=method, block_size=block_size, C=C)
     
+    # Binarize
+    if method == "adaptive":
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, block_size, C
+        )
+    else:
+        binary = binarize_image(gray, method=method)
+    
+    # Apply denoising
     if use_denoise:
-        processed = denoise(binary, kernel_size=kernel_size)
+        processed = denoise(binary, kernal_size=kernel_size)
     else:
         processed = binary
+    
+    # Store for display
+    processed_display = processed.copy()
+    num_segments = 1
+    
+    # Apply untangling
+    if use_untangle:
+        labels = run_untangling(processed)
+        num_segments = labels.max()
+        
+        # Create colored visualization of segments
+        # Each segment gets a unique gray value
+        processed_display = np.zeros_like(processed, dtype=np.uint8)
+        
+        for label_id in range(1, num_segments + 1):
+            # Assign different intensities to each segment
+            intensity = int((label_id / num_segments) * 200 + 55)  # Scale to 55-255 range
+            processed_display[labels == label_id] = intensity
     
     # ===== DISPLAY =====
     st.subheader(f"Box {selected_id}")
@@ -187,20 +199,26 @@ def main():
         plt.close()
     
     with col3:
-        st.write("Processed")
+        st.write("Processed" + (" (Untangled)" if use_untangle else ""))
         fig3, ax3 = plt.subplots(figsize=(5, 5))
-        ax3.imshow(processed, cmap='gray')
+        if use_untangle:
+            # Show with color to see different segments
+            ax3.imshow(processed_display, cmap='nipy_spectral')
+        else:
+            ax3.imshow(processed_display, cmap='gray')
         ax3.axis('off')
         st.pyplot(fig3)
         plt.close()
     
-    # Stats
+    # ===== STATS =====
     st.write(f"**Size:** {x_max_px - x_min_px} x {y_max_px - y_min_px} pixels")
     st.write(f"**Method:** {method}")
     if method == "adaptive":
         st.write(f"**Block Size:** {block_size}, **C:** {C}")
     if use_denoise:
-        st.write(f"**Kernel Size:** {kernel_size}")
+        st.write(f"**Denoising Kernel:** {kernel_size}")
+    if use_untangle:
+        st.write(f"**Separated Segments:** {num_segments}")
 
 
 if __name__ == "__main__":
