@@ -2,7 +2,6 @@
 # object selection
 # shape analysis
 import numpy as np
-from scipy import ndimage
 import matplotlib.pyplot as plt
 import cv2
 
@@ -17,7 +16,7 @@ import cv2
 #     return labeled_array, num_features
 
 
-def con_comp_a(binary_image):
+def cca(binary_image):
     """ 
     returns : 
         num_labels - total number of objects found (including background)
