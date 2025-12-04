@@ -6,10 +6,9 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 # Import from src folder
-from src.preprocessing import convert_to_gray, binarize_image, denoise
-from src.untangling import run_untangling
+from src.preprocessing import convert_to_gray, binarize_image, denoise, connect_segments
+from src.untangling import run_untangling, get_skeleton, find_junctions
 from src.segmentation import cca, get_valid_obj
-from src.evaluation import continuous_iou, smooth_mask
 
 # ===== BBOX PARSING =====
 
@@ -39,7 +38,7 @@ def parse_yolo_boxes(bbox_text):
 # ===== MAIN APP =====
 
 def main():
-    st.title("Neuron Bounding Box Viewer")
+    st.title("Neuron Segmentation Pipeline - Simplified View")
     
     # Upload image
     uploaded_file = st.file_uploader("Upload Image", type=['tif', 'tiff', 'png', 'jpg', 'bmp'])
@@ -67,66 +66,36 @@ def main():
         st.error("No valid bounding boxes found")
         return
     
-    # ===== OVERVIEW =====
-    st.subheader("Overview")
+    # ===== SIDEBAR CONTROLS =====
+    st.sidebar.header("Processing Parameters")
     
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.imshow(img_array)
-    
-    for box in boxes:
-        x_min_px = int(box['x_min'] * width)
-        y_min_px = int(box['y_min'] * height)
-        x_max_px = int(box['x_max'] * width)
-        y_max_px = int(box['y_max'] * height)
-        
-        rect = Rectangle(
-            (x_min_px, y_min_px),
-            x_max_px - x_min_px,
-            y_max_px - y_min_px,
-            fill=False, edgecolor='red', linewidth=2
-        )
-        ax.add_patch(rect)
-        ax.text(x_min_px, y_min_px - 5, f"Box {box['id']}", 
-               color='red', fontsize=10, weight='bold')
-    
-    ax.axis('off')
-    st.pyplot(fig)
-    plt.close()
-    
-    # ===== SELECT BOX =====
-    st.subheader("Select Box")
-    selected_id = st.selectbox(
+    # Select box
+    selected_id = st.sidebar.selectbox(
         "Choose box:",
         [b['id'] for b in boxes],
         format_func=lambda x: f"Box {x}"
     )
     
-    # ===== PROCESSING CONTROLS =====
-    st.write("---")
-    st.subheader("Processing Controls")
+    st.sidebar.write("---")
     
-    col_control1, col_control2 = st.columns(2)
+    # Binary conversion
+    method = st.sidebar.radio("Binary Method:", ["otsu", "adaptive"])
     
-    with col_control1:
-        st.write("**Binary Conversion**")
-        method = st.radio("Method:", ["otsu", "adaptive"])
-        
-        block_size = 11
-        C = 2
-        if method == "adaptive":
-            block_size = st.slider("Block Size:", 3, 51, 11, step=2)
-            C = st.slider("C (constant):", -10, 10, 2)
+    # Denoising
+    use_denoise = st.sidebar.checkbox("Apply denoising", value=True)
+    denoise_kernel = st.sidebar.slider("Denoise Kernel:", 1, 15, 3, step=2) if use_denoise else 3
     
-    with col_control2:
-        st.write("**Morphological Operations**")
-        use_denoise = st.checkbox("Apply denoising", value=True)
-        kernel_size = 3
-        if use_denoise:
-            kernel_size = st.slider("Kernel Size:", 1, 15, 3, step=2)
-        
-        use_untangle = st.checkbox("Untangle touching neurons", value=False)
+    # Connect segments
+    use_connect = st.sidebar.checkbox("Connect broken segments", value=True)
+    connect_kernel = st.sidebar.slider("Connect Kernel:", 3, 15, 5, step=2) if use_connect else 5
+    connect_iterations = st.sidebar.slider("Connect Iterations:", 1, 5, 2) if use_connect else 2
     
-    st.write("---")
+    # Segmentation
+    min_area = st.sidebar.slider("Min area (filter noise):", 50, 2000, 500, step=50)
+    
+    # Untangling
+    use_untangle = st.sidebar.checkbox("Untangle touching neurons", value=True)
+    min_junctions = st.sidebar.slider("Min junctions to untangle:", 1, 20, 3) if use_untangle else 3
     
     # ===== GET SELECTED BOX =====
     box = [b for b in boxes if b['id'] == selected_id][0]
@@ -140,87 +109,206 @@ def main():
     # Crop to bounding box
     cropped = img_array[y_min_px:y_max_px, x_min_px:x_max_px]
     
-    # ===== PROCESS IMAGE =====
+    # ===== PROCESSING PIPELINE =====
+    
     # Convert to grayscale
     gray = convert_to_gray(cropped)
     
-    # Binarize
-    if method == "adaptive":
-        binary = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, block_size, C
+    # Binarization
+    binary = binarize_image(gray, method=method)
+    
+    # Denoising
+    if use_denoise:
+        cleaned = denoise(binary, kernal_size=denoise_kernel)
+    else:
+        cleaned = binary
+    
+    # SAVE STATE: Before connecting
+    before_connect = cleaned.copy()
+    
+    # Connect segments (bridge gaps)
+    if use_connect:
+        cleaned = connect_segments(cleaned, kernel_size=connect_kernel, iterations=connect_iterations)
+    
+    # SAVE STATE: After connecting
+    after_connect = cleaned.copy()
+    
+    # CCA - Find connected components
+    num_labels, labels, stats, centroids = cca(cleaned)
+    
+    # Get valid objects
+    neuron_masks = get_valid_obj(num_labels, labels, stats, min_area=min_area)
+    
+    # ===== COLLECT SKELETONIZATION DATA =====
+    skeleton_data = []
+    
+    for i, mask in enumerate(neuron_masks):
+        skeleton = get_skeleton(mask)
+        junctions = find_junctions(skeleton)
+        
+        skeleton_data.append({
+            'mask': mask,
+            'skeleton': skeleton,
+            'junctions': junctions,
+            'num_junctions': len(junctions)
+        })
+    
+    # ===== UNTANGLING =====
+    final_masks = []
+    
+    if use_untangle:
+        for i, mask in enumerate(neuron_masks):
+            # Check if there are enough junctions to untangle
+            num_junctions = skeleton_data[i]['num_junctions']
+            
+            if num_junctions >= min_junctions:
+                # Run untangling
+                labels_untangled = run_untangling(mask, min_junctions=min_junctions)
+                
+                # Get unique labels
+                unique_labels = np.unique(labels_untangled)
+                unique_labels = unique_labels[unique_labels > 0]
+                
+                # Extract each segment
+                for label_id in unique_labels:
+                    segment_mask = (labels_untangled == label_id).astype(np.uint8) * 255
+                    if segment_mask.sum() > 0:
+                        final_masks.append(segment_mask)
+            else:
+                # Keep as is
+                final_masks.append(mask)
+    else:
+        final_masks = neuron_masks
+    
+    # ===== ORIGINAL IMAGE OVERVIEW =====
+    st.subheader("Full Image with Bounding Boxes")
+    
+    fig_overview, ax_overview = plt.subplots(figsize=(12, 8))
+    ax_overview.imshow(img_array)
+    
+    for b in boxes:
+        bx_min = int(b['x_min'] * width)
+        by_min = int(b['y_min'] * height)
+        bx_max = int(b['x_max'] * width)
+        by_max = int(b['y_max'] * height)
+        
+        # Highlight selected box
+        color = 'red' if b['id'] == selected_id else 'red'
+        linewidth = 3 if b['id'] == selected_id else 2
+        
+        rect = Rectangle(
+            (bx_min, by_min),
+            bx_max - bx_min,
+            by_max - by_min,
+            fill=False, edgecolor=color, linewidth=linewidth
         )
-    else:
-        binary = binarize_image(gray, method=method)
+        ax_overview.add_patch(rect)
+        ax_overview.text(bx_min, by_min - 5, f"Box {b['id']}", 
+                        color=color, fontsize=12, weight='bold')
     
-    # Apply denoising
-    if use_denoise:
-        processed = denoise(binary, kernal_size=kernel_size)
-    else:
-        processed = binary
+    ax_overview.axis('off')
+    st.pyplot(fig_overview)
+    plt.close()
     
-    # Store for display
-    processed_display = processed.copy()
-    num_segments = 1
+    st.write("---")
     
-    # Apply untangling
-    if use_untangle:
-        labels = run_untangling(processed)
-        num_segments = labels.max()
+    # ===== 4-STAGE VISUALIZATION =====
+    
+    st.subheader("Processing Pipeline Visualization")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    
+    # Stage 1: Original Image
+    axes[0, 0].imshow(cropped)
+    axes[0, 0].set_title("1. Original Image (Cropped)", fontsize=14, weight='bold')
+    axes[0, 0].axis('off')
+    
+    # Stage 2: After Connecting Broken Parts
+    axes[0, 1].imshow(after_connect, cmap='gray')
+    axes[0, 1].set_title(
+        "2. Connected Segments" if use_connect else "2. No Connection Applied",
+        fontsize=14, weight='bold'
+    )
+    axes[0, 1].axis('off')
+    
+    # Stage 3: Skeletonization with Junctions
+    # Create composite image showing all skeletons
+    skeleton_composite = np.zeros_like(after_connect, dtype=np.uint8)
+    junction_points = []
+    
+    for data in skeleton_data:
+        skeleton_composite = np.maximum(skeleton_composite, data['skeleton'])
+        if len(data['junctions']) > 0:
+            junction_points.extend(data['junctions'])
+    
+    # Show original mask as background, skeleton in red, junctions in blue
+    axes[1, 0].imshow(after_connect, cmap='gray', alpha=0.3)
+    axes[1, 0].imshow(skeleton_composite, cmap='Reds', alpha=0.7)
+    
+    if len(junction_points) > 0:
+        junction_points = np.array(junction_points)
+        axes[1, 0].scatter(
+            junction_points[:, 1], 
+            junction_points[:, 0],
+            c='blue', s=100, marker='x', linewidths=3, label='Junctions'
+        )
+        axes[1, 0].legend(loc='upper right')
+    
+    total_junctions = sum(d['num_junctions'] for d in skeleton_data)
+    axes[1, 0].set_title(
+        f"3. Skeletonization\n({len(neuron_masks)} blobs, {total_junctions} junctions)",
+        fontsize=14, weight='bold'
+    )
+    axes[1, 0].axis('off')
+    
+    # Stage 4: Final Output
+    # Combine all final masks with different colors
+    final_composite = np.zeros((*after_connect.shape, 3), dtype=np.uint8)
+    
+    # Generate distinct colors for each neuron
+    np.random.seed(42)  # For consistent colors
+    colors = []
+    for i in range(len(final_masks)):
+        color = tuple(np.random.randint(50, 255, size=3).tolist())
+        colors.append(color)
+    
+    for i, mask in enumerate(final_masks):
+        mask_bool = mask > 0
+        final_composite[mask_bool] = colors[i]
+    
+    axes[1, 1].imshow(final_composite)
+    axes[1, 1].set_title(
+        f"4. Final Output\n({len(final_masks)} neurons detected)",
+        fontsize=14, weight='bold'
+    )
+    axes[1, 1].axis('off')
+    
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close()
+    
+    # ===== NEURON SELECTION =====
+    if len(final_masks) > 0:
+        st.write("---")
+        st.subheader("Select a Neuron to Display")
         
-        # Create colored visualization of segments
-        # Each segment gets a unique gray value
-        processed_display = np.zeros_like(processed, dtype=np.uint8)
+        selected_neuron = st.selectbox(
+            "Choose neuron:",
+            range(1, len(final_masks) + 1),
+            format_func=lambda x: f"Neuron #{x}"
+        )
         
-        for label_id in range(1, num_segments + 1):
-            # Assign different intensities to each segment
-            intensity = int((label_id / num_segments) * 200 + 55)  # Scale to 55-255 range
-            processed_display[labels == label_id] = intensity
-    
-    # ===== DISPLAY =====
-    st.subheader(f"Box {selected_id}")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.write("Original")
-        fig1, ax1 = plt.subplots(figsize=(5, 5))
-        ax1.imshow(cropped)
-        ax1.axis('off')
-        st.pyplot(fig1)
+        # Display selected neuron
+        st.write(f"**Displaying Neuron #{selected_neuron}:**")
+        
+        fig_selected, ax_selected = plt.subplots(figsize=(6, 6))
+        ax_selected.imshow(final_masks[selected_neuron - 1], cmap='gray')
+        ax_selected.set_title(f"Neuron #{selected_neuron}", fontsize=16, weight='bold')
+        ax_selected.axis('off')
+        st.pyplot(fig_selected)
         plt.close()
-    
-    with col2:
-        st.write("Binary")
-        fig2, ax2 = plt.subplots(figsize=(5, 5))
-        ax2.imshow(binary, cmap='gray')
-        ax2.axis('off')
-        st.pyplot(fig2)
-        plt.close()
-    
-    with col3:
-        st.write("Processed" + (" (Untangled)" if use_untangle else ""))
-        fig3, ax3 = plt.subplots(figsize=(5, 5))
-        if use_untangle:
-            # Show with color to see different segments
-            ax3.imshow(processed_display, cmap='nipy_spectral')
-        else:
-            ax3.imshow(processed_display, cmap='gray')
-        ax3.axis('off')
-        st.pyplot(fig3)
-        plt.close()
-    
-    # ===== STATS =====
-    st.write(f"**Size:** {x_max_px - x_min_px} x {y_max_px - y_min_px} pixels")
-    st.write(f"**Method:** {method}")
-    if method == "adaptive":
-        st.write(f"**Block Size:** {block_size}, **C:** {C}")
-    if use_denoise:
-        st.write(f"**Denoising Kernel:** {kernel_size}")
-    if use_untangle:
-        st.write(f"**Separated Segments:** {num_segments}")
 
 
 if __name__ == "__main__":
-    st.set_page_config(layout="wide")
+    st.set_page_config(layout="wide", page_title="Neuron Segmentation")
     main()

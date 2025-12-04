@@ -23,7 +23,7 @@ def find_junctions(skeleton):
     kernal = np.array([[1,1,1], [ 1,0,1], [1,1,1]])
 
     neighbor_count = convolve(skeleton_bool, kernal, mode="constant", cval=0)
-    junctions = (skeleton_bool == 1) & (neighbor_count > 2)
+    junctions = (skeleton_bool == 1) & (neighbor_count > 3)
 
     return np.argwhere(junctions)
 
@@ -51,7 +51,7 @@ def regrow_segments(cut_skeleton, original_mask):
     
     return labels 
 
-def run_untangling(binary_mask):
+def run_untangling(binary_mask, min_junctions=3):
     # 1. thinning
     skeleton = get_skeleton(binary_mask)
 
