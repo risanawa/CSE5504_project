@@ -17,7 +17,7 @@ def convert_to_gray(image):
         return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     return image
 
-def binarize_image(gray_image, method="otsu"):
+def binarize_image(gray_image, method="adaptive"):
     """
     gray_image : input grayscale image 
     method : 'otsu' (easy) & 'adaptive' (hard/real)
@@ -44,6 +44,7 @@ def binarize_image(gray_image, method="otsu"):
     
     return binary
 
+# IF OTSU IS USED, NO DENOISING!
 
 # NOISE REDUCTION -----------------------------
 
@@ -53,7 +54,8 @@ def denoise(binary_image, kernal_size = 3):
     # opening : remove noise from background
     cleaned = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernal)
 
-    # closing : fill black holes
+    # MAKE BIGGER?
+    # closing : fill black holes 
     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernal)
 
     return cleaned
