@@ -23,7 +23,7 @@ def find_junctions(skeleton):
     kernal = np.array([[1,1,1], [ 1,0,1], [1,1,1]])
 
     neighbor_count = convolve(skeleton_bool, kernal, mode="constant", cval=0)
-    junctions = (skeleton_bool == 1) & (neighbor_count > 3)
+    junctions = (skeleton_bool == 1) & (neighbor_count > 4)
 
     return np.argwhere(junctions)
 
@@ -45,7 +45,7 @@ def regrow_segments(cut_skeleton, original_mask):
     
     # calculate the distance between each pixel and the background
     distance = cv2.distanceTransform(original_mask, cv2.DIST_L2, 5)
-
+    distance = cv2.GaussianBlur(distance, (3, 3), 0)
     # apply watershed 
     labels = watershed(-distance, markers, mask=original_mask)
     

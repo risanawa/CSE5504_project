@@ -4,13 +4,12 @@ from PIL import Image
 import cv2
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+from scipy.optimize import linear_sum_assignment
 
-# Import from src folder
 from src.preprocessing import convert_to_gray, binarize_image, denoise, connect_segments
 from src.untangling import run_untangling, get_skeleton, find_junctions
 from src.segmentation import cca, get_valid_obj
 
-# ===== BBOX PARSING =====
 
 def parse_yolo_boxes(bbox_text):
     boxes = []
@@ -95,7 +94,6 @@ def main():
     
     # Untangling
     use_untangle = st.sidebar.checkbox("Untangle touching neurons", value=True)
-    min_junctions = st.sidebar.slider("Min junctions to untangle:", 1, 20, 3) if use_untangle else 3
     
     # ===== GET SELECTED BOX =====
     box = [b for b in boxes if b['id'] == selected_id][0]
@@ -158,12 +156,12 @@ def main():
     
     if use_untangle:
         for i, mask in enumerate(neuron_masks):
-            # Check if there are enough junctions to untangle
+            # Check if there are any junctions
             num_junctions = skeleton_data[i]['num_junctions']
             
-            if num_junctions >= min_junctions:
+            if num_junctions > 0:
                 # Run untangling
-                labels_untangled = run_untangling(mask, min_junctions=min_junctions)
+                labels_untangled = run_untangling(mask, min_junctions=0)
                 
                 # Get unique labels
                 unique_labels = np.unique(labels_untangled)
@@ -175,10 +173,20 @@ def main():
                     if segment_mask.sum() > 0:
                         final_masks.append(segment_mask)
             else:
-                # Keep as is
+                # Keep as is (no junctions found)
                 final_masks.append(mask)
     else:
         final_masks = neuron_masks
+    
+    # Store masks in bbox coordinates for display
+    final_masks_bbox = final_masks.copy()
+    
+    # Convert masks to full image coordinates for IoU evaluation
+    final_masks_full = []
+    for mask in final_masks:
+        full_mask = np.zeros((height, width), dtype=np.uint8)
+        full_mask[y_min_px:y_max_px, x_min_px:x_max_px] = mask
+        final_masks_full.append(full_mask)
     
     # ===== ORIGINAL IMAGE OVERVIEW =====
     st.subheader("Full Image with Bounding Boxes")
@@ -256,7 +264,7 @@ def main():
     
     total_junctions = sum(d['num_junctions'] for d in skeleton_data)
     axes[1, 0].set_title(
-        f"3. Skeletonization\n({len(neuron_masks)} blobs, {total_junctions} junctions)",
+        f"3. Skeletonization",
         fontsize=14, weight='bold'
     )
     axes[1, 0].axis('off')
@@ -272,13 +280,13 @@ def main():
         color = tuple(np.random.randint(50, 255, size=3).tolist())
         colors.append(color)
     
-    for i, mask in enumerate(final_masks):
+    for i, mask in enumerate(final_masks_bbox):
         mask_bool = mask > 0
         final_composite[mask_bool] = colors[i]
     
     axes[1, 1].imshow(final_composite)
     axes[1, 1].set_title(
-        f"4. Final Output\n({len(final_masks)} neurons detected)",
+        f"4. Final Output",
         fontsize=14, weight='bold'
     )
     axes[1, 1].axis('off')
@@ -288,13 +296,13 @@ def main():
     plt.close()
     
     # ===== NEURON SELECTION =====
-    if len(final_masks) > 0:
+    if len(final_masks_bbox) > 0:
         st.write("---")
         st.subheader("Select a Neuron to Display")
         
         selected_neuron = st.selectbox(
             "Choose neuron:",
-            range(1, len(final_masks) + 1),
+            range(1, len(final_masks_bbox) + 1),
             format_func=lambda x: f"Neuron #{x}"
         )
         
@@ -302,11 +310,226 @@ def main():
         st.write(f"**Displaying Neuron #{selected_neuron}:**")
         
         fig_selected, ax_selected = plt.subplots(figsize=(6, 6))
-        ax_selected.imshow(final_masks[selected_neuron - 1], cmap='gray')
+        ax_selected.imshow(final_masks_bbox[selected_neuron - 1], cmap='gray')
         ax_selected.set_title(f"Neuron #{selected_neuron}", fontsize=16, weight='bold')
         ax_selected.axis('off')
         st.pyplot(fig_selected)
         plt.close()
+    
+    # ===== IOU EVALUATION =====
+    st.write("---")
+    st.subheader("IoU Evaluation")
+    
+    gt_file = st.file_uploader("Upload Ground Truth", 
+                               type=['txt'], key='gt_upload')
+    
+    if gt_file is not None:
+        try:
+            # Parse ground truth polygons
+            polygons = []
+            content = gt_file.read().decode('utf-8')
+            for line in content.strip().split('\n'):
+                coords = list(map(int, line.strip().split(',')))
+                points = np.array(coords).reshape(-1, 2)
+                polygons.append(points)
+            
+            # Convert to masks
+            gt_masks = []
+            for poly in polygons:
+                mask = np.zeros((height, width), dtype=np.uint8)
+                cv2.fillPoly(mask, [poly], 255)
+                gt_masks.append(mask)
+            
+            # Calculate IoU for each prediction
+            from scipy.optimize import linear_sum_assignment
+            
+            n_pred = len(final_masks_full)
+            n_gt = len(gt_masks)
+            
+            if n_pred > 0 and n_gt > 0:
+                # Cost matrix
+                cost_matrix = np.zeros((n_pred, n_gt))
+                
+                for i, pred_mask in enumerate(final_masks_full):
+                    for j, gt_mask in enumerate(gt_masks):
+                        pred_bool = pred_mask > 0
+                        gt_bool = gt_mask > 0
+                        intersection = np.logical_and(pred_bool, gt_bool).sum()
+                        union = np.logical_or(pred_bool, gt_bool).sum()
+                        iou = intersection / union if union > 0 else 0.0
+                        cost_matrix[i, j] = -iou
+                
+                # Match
+                row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                
+                matches = [(i, j, -cost_matrix[i, j]) for i, j in zip(row_ind, col_ind) if -cost_matrix[i, j] > 0]
+                matched_ious = [iou for _, _, iou in matches]
+                
+                if len(matched_ious) > 0:
+                    mean_iou = np.mean(matched_ious)
+                    st.success(f"**IoU: {mean_iou:.1%}**")
+                    
+                    # Visualization
+                    fig_comp, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+                    
+                    # Ground truth
+                    ax1.imshow(cropped)
+                    for i, gt_mask in enumerate(gt_masks):
+                        gt_crop = gt_mask[y_min_px:y_max_px, x_min_px:x_max_px]
+                        contours, _ = cv2.findContours(gt_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours:
+                            ax1.plot(contour[:, 0, 0], contour[:, 0, 1], 'g-', linewidth=2, alpha=0.8)
+                    ax1.set_title(f"Ground Truth", fontsize=14, weight='bold')
+                    ax1.axis('off')
+                    
+                    # Predictions
+                    ax2.imshow(cropped)
+                    for i, pred_mask in enumerate(final_masks_bbox):
+                        contours, _ = cv2.findContours(pred_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours:
+                            ax2.plot(contour[:, 0, 0], contour[:, 0, 1], 'r-', linewidth=2, alpha=0.8)
+                    ax2.set_title(f"Predictions", fontsize=14, weight='bold')
+                    ax2.axis('off')
+                    
+                    # Matched pairs with IoU scores
+                    ax3.imshow(cropped)
+                    for pred_idx, gt_idx, iou in matches:
+                        # Draw prediction in red
+                        pred_mask = final_masks_bbox[pred_idx]
+                        contours_pred, _ = cv2.findContours(pred_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours_pred:
+                            ax3.plot(contour[:, 0, 0], contour[:, 0, 1], 'r-', linewidth=2, alpha=0.6)
+                        
+                        # Draw ground truth in green
+                        gt_crop = gt_masks[gt_idx][y_min_px:y_max_px, x_min_px:x_max_px]
+                        contours_gt, _ = cv2.findContours(gt_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours_gt:
+                            ax3.plot(contour[:, 0, 0], contour[:, 0, 1], 'g-', linewidth=2, alpha=0.6)
+                    
+                    ax3.set_title(f"Matched Pairs (Red=Pred, Green=GT)", fontsize=14, weight='bold')
+                    ax3.axis('off')
+                    
+                    plt.tight_layout()
+                    st.pyplot(fig_comp)
+                    plt.close()
+                else:
+                    st.warning("No matches found")
+            else:
+                st.warning(f"Cannot calculate IoU: {n_pred} predictions, {n_gt} ground truth")
+        
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+    
+    # ===== COMPARE WITH OTHER MODEL =====
+    st.write("---")
+    st.subheader("Compare with Given Model")
+    
+    other_model_file = st.file_uploader("Upload Other Given Predictions", 
+                                        type=['txt'], key='other_model_upload')
+    
+    if other_model_file is not None and gt_file is not None:
+        try:
+            # Parse other model polygons
+            other_polygons = []
+            content = other_model_file.read().decode('utf-8')
+            for line in content.strip().split('\n'):
+                coords = list(map(int, line.strip().split(',')))
+                points = np.array(coords).reshape(-1, 2)
+                other_polygons.append(points)
+            
+            # Convert to masks
+            other_masks_full = []
+            for poly in other_polygons:
+                mask = np.zeros((height, width), dtype=np.uint8)
+                cv2.fillPoly(mask, [poly], 255)
+                other_masks_full.append(mask)
+            
+            # Convert to bbox coordinates for display
+            other_masks_bbox = []
+            for mask in other_masks_full:
+                bbox_mask = mask[y_min_px:y_max_px, x_min_px:x_max_px]
+                other_masks_bbox.append(bbox_mask)
+            
+            # Calculate IoU for other model
+            n_other = len(other_masks_full)
+            
+            if n_other > 0 and len(gt_masks) > 0:
+                # Cost matrix
+                cost_matrix_other = np.zeros((n_other, len(gt_masks)))
+                
+                for i, other_mask in enumerate(other_masks_full):
+                    for j, gt_mask in enumerate(gt_masks):
+                        other_bool = other_mask > 0
+                        gt_bool = gt_mask > 0
+                        intersection = np.logical_and(other_bool, gt_bool).sum()
+                        union = np.logical_or(other_bool, gt_bool).sum()
+                        iou = intersection / union if union > 0 else 0.0
+                        cost_matrix_other[i, j] = -iou
+                
+                # Match
+                row_ind_other, col_ind_other = linear_sum_assignment(cost_matrix_other)
+                
+                matches_other = [(i, j, -cost_matrix_other[i, j]) for i, j in zip(row_ind_other, col_ind_other) if -cost_matrix_other[i, j] > 0]
+                matched_ious_other = [iou for _, _, iou in matches_other]
+                
+                if len(matched_ious_other) > 0:
+                    mean_iou_other = np.mean(matched_ious_other)
+                    st.info(f"**IoU: {mean_iou_other:.1%}**")
+                    
+                    # Comparison visualization
+                    fig_comp2, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+                    
+                    # Ground truth
+                    ax1.imshow(cropped)
+                    for i, gt_mask in enumerate(gt_masks):
+                        gt_crop = gt_mask[y_min_px:y_max_px, x_min_px:x_max_px]
+                        contours, _ = cv2.findContours(gt_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours:
+                            ax1.plot(contour[:, 0, 0], contour[:, 0, 1], 'g-', linewidth=2, alpha=0.8)
+                    ax1.set_title(f"Ground Truth", fontsize=14, weight='bold')
+                    ax1.axis('off')
+                    
+                    # Other model predictions
+                    ax2.imshow(cropped)
+                    for i, other_mask in enumerate(other_masks_bbox):
+                        contours, _ = cv2.findContours(other_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours:
+                            ax2.plot(contour[:, 0, 0], contour[:, 0, 1], 'b-', linewidth=2, alpha=0.8)
+                    ax2.set_title(f"Given Model", fontsize=14, weight='bold')
+                    ax2.axis('off')
+                    
+                    # Matched pairs
+                    ax3.imshow(cropped)
+                    for pred_idx, gt_idx, iou in matches_other:
+                        # Draw prediction in blue
+                        other_mask = other_masks_bbox[pred_idx]
+                        contours_pred, _ = cv2.findContours(other_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours_pred:
+                            ax3.plot(contour[:, 0, 0], contour[:, 0, 1], 'b-', linewidth=2, alpha=0.6)
+                        
+                        # Draw ground truth in green
+                        gt_crop = gt_masks[gt_idx][y_min_px:y_max_px, x_min_px:x_max_px]
+                        contours_gt, _ = cv2.findContours(gt_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours_gt:
+                            ax3.plot(contour[:, 0, 0], contour[:, 0, 1], 'g-', linewidth=2, alpha=0.6)
+                    
+                    ax3.set_title(f"Matched Pairs (Blue=Other, Green=GT)", fontsize=14, weight='bold')
+                    ax3.axis('off')
+                    
+                    plt.tight_layout()
+                    st.pyplot(fig_comp2)
+                    plt.close()
+                    
+               
+                else:
+                    st.warning("No matches found for other model")
+            else:
+                st.warning(f"Cannot calculate IoU: {n_other} predictions, {len(gt_masks)} ground truth")
+        
+        except Exception as e:
+            st.error(f"Error processing other model file: {str(e)}")
+    elif other_model_file is not None and gt_file is None:
+        st.warning("Please upload ground truth first before comparing models")
 
 
 if __name__ == "__main__":
